@@ -101,21 +101,40 @@ class AzureHandle:
     def container_app_running_replicas(self, container_app):
         """Return the currently running replica count for a Container App.
 
-        Container Apps scale per-revision, so we enumerate revisions and sum
-        ``replicas`` across active ones. ``replicas`` reflects the currently
-        running replica count reported by the platform.
+        Container Apps scale per-revision. For each *active* revision we
+        enumerate its replicas via the ``container_apps_revision_replicas``
+        subresource and count only those whose ``running_state`` is
+        ``"Running"``. This excludes replicas that the portal shows as
+        ``Provisioning``, ``Failed``, ``Degraded``, ``Stopped``, or
+        ``Unknown`` — ``revision.replicas`` on its own includes all of
+        those, which over-counts live workload.
         """
         parsed_id = msrestazure.tools.parse_resource_id(container_app.id)
+        rg = parsed_id['resource_group']
+        app_name = parsed_id['resource_name']
         client = self.container_apps_client(parsed_id['subscription'])
         total = 0
         revisions = client.container_apps_revisions.list_revisions(
-            resource_group_name=parsed_id['resource_group'],
-            container_app_name=parsed_id['resource_name'],
+            resource_group_name=rg,
+            container_app_name=app_name,
         )
         for revision in revisions:
             if not getattr(revision, 'active', False):
                 continue
-            total += revision.replicas or 0
+            try:
+                replicas = client.container_apps_revision_replicas.list_replicas(
+                    resource_group_name=rg,
+                    container_app_name=app_name,
+                    revision_name=revision.name,
+                )
+            except Exception as e:  # pylint: disable=broad-except
+                log.warning("Failed to list replicas for Container App '%s' revision '%s': %s",
+                            app_name, revision.name, e)
+                continue
+            # list_replicas returns a ReplicaCollection wrapper, not a paged iterator.
+            for replica in getattr(replicas, 'value', []) or []:
+                if getattr(replica, 'running_state', None) == 'Running':
+                    total += 1
         return total
 
     def container_aci(self, aci_resource):
