@@ -70,10 +70,27 @@ class AzureHandle:
         return self.container_client(subscription_id).open_shift_managed_clusters.list()
 
     def container_vmss(self, aks_resource):
+        """Yield (pool_name, vm_count) for each VMSS backing an AKS cluster.
+
+        We enumerate VMSS in the cluster's node resource group rather than trusting
+        ``AgentPool.count``, which is ``None`` for autoscaler-managed and virtual-node
+        pools. Each AKS-managed VMSS carries an ``aks-managed-poolName`` tag we use
+        to attribute the count back to a node pool.
+        """
         parsed_id = msrestazure.tools.parse_resource_id(aks_resource.id)
-        client = self.container_client(parsed_id['subscription'])
-        return client.agent_pools.list(resource_group_name=parsed_id['resource_group'],
-                                       resource_name=parsed_id['resource_name'])
+        subscription_id = parsed_id['subscription']
+        cluster = self.container_client(subscription_id).managed_clusters.get(
+            resource_group_name=parsed_id['resource_group'],
+            resource_name=parsed_id['resource_name'],
+        )
+        node_rg = cluster.node_resource_group
+        compute = self.compute_client(subscription_id)
+        for vmss in compute.virtual_machine_scale_sets.list(resource_group_name=node_rg):
+            tags = vmss.tags or {}
+            pool_name = tags.get('aks-managed-poolName') or tags.get('poolName') or vmss.name
+            vm_count = sum(1 for _ in compute.virtual_machine_scale_set_vms.list(
+                resource_group_name=node_rg, virtual_machine_scale_set_name=vmss.name))
+            yield pool_name, vm_count
 
     def container_aci(self, aci_resource):
         parsed_id = msrestazure.tools.parse_resource_id(aci_resource.id)
@@ -83,9 +100,13 @@ class AzureHandle:
 
     def vms_inside_vmss(self, vmss_resource):
         parsed_id = msrestazure.tools.parse_resource_id(vmss_resource.id)
-        client = ComputeManagementClient(self.creds, parsed_id['subscription'])
+        client = self.compute_client(parsed_id['subscription'])
         return client.virtual_machine_scale_set_vms.list(resource_group_name=parsed_id['resource_group'],
                                                          virtual_machine_scale_set_name=vmss_resource.name)
+
+    @lru_cache
+    def compute_client(self, subscription_id):
+        return ComputeManagementClient(self.creds, subscription_id)
 
     @lru_cache
     def container_client(self, subscription_id):
@@ -265,10 +286,10 @@ def main():
 
         # (1) Process AKS
         for aks in az.aks_resources(subscription.subscription_id):
-            for node_pool in az.container_vmss(aks):
+            for pool_name, node_count in az.container_vmss(aks):
                 log.info("Identified node pool: '%s' within AKS: '%s' with %d node(s)",
-                         node_pool.name, aks.name, node_pool.count)
-                row['aks_nodes'] += node_pool.count
+                         pool_name, aks.name, node_count)
+                row['aks_nodes'] += node_count
 
         # (2) Process VMSS
         for vmss in az.vmss_resources(subscription.subscription_id):
